@@ -45,3 +45,18 @@ A moon icon appears in the status bar. Click it to pick a mode:
 | **Off**     | Stops the lamp script |
 
 Switching modes kills the running process and starts a new one automatically.
+
+The menu also has a **Sample region** section that controls which part of the
+screen is averaged:
+
+| Region     | What is sampled |
+|------------|-----------------|
+| **Top**    | Top 20% of the frame |
+| **Bottom** | Bottom 20% |
+| **Left**   | Left 20% |
+| **Right**  | Right 20% |
+| **Border** | All four edges (default — good for a lamp behind the monitor) |
+| **Full**   | Entire screen |
+
+Changing the region while the lamp is on restarts the subprocess automatically.
+The same option is available on the command line: `--region top` etc.

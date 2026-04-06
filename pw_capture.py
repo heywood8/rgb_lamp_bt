@@ -215,10 +215,80 @@ _pw.pw_proxy_destroy.argtypes = [_P]
 # PwCapture
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Region samplers
+# ---------------------------------------------------------------------------
+
+def _make_sampler(region: str):
+    """
+    Return a function  sample(arr) -> bgra_mean
+    where arr has shape (h, w, 4) in BGRA order.
+
+    region must be one of:
+        top | bottom | left | right | border | full
+    """
+    S = 8  # spatial step — every 8th pixel along each axis
+
+    region = region.lower()
+
+    if region == "top":
+        def sample(arr):
+            h = arr.shape[0]
+            bh = max(1, h // 5)
+            return arr[:bh:S, ::S, :].mean(axis=(0, 1))
+
+    elif region == "bottom":
+        def sample(arr):
+            h = arr.shape[0]
+            bh = max(1, h // 5)
+            return arr[-bh::S, ::S, :].mean(axis=(0, 1))
+
+    elif region == "left":
+        def sample(arr):
+            w = arr.shape[1]
+            bw = max(1, w // 5)
+            return arr[::S, :bw:S, :].mean(axis=(0, 1))
+
+    elif region == "right":
+        def sample(arr):
+            w = arr.shape[1]
+            bw = max(1, w // 5)
+            return arr[::S, -bw::S, :].mean(axis=(0, 1))
+
+    elif region == "border":
+        def sample(arr):
+            h, w = arr.shape[:2]
+            bh = max(1, h // 5)
+            bw = max(1, w // 5)
+            # Average four bands without a concatenate allocation
+            return (
+                arr[:bh:S,      ::S,    :].mean(axis=(0, 1))
+                + arr[-bh::S,   ::S,    :].mean(axis=(0, 1))
+                + arr[bh:-bh:S, :bw:S,  :].mean(axis=(0, 1))
+                + arr[bh:-bh:S, -bw::S, :].mean(axis=(0, 1))
+            ) * 0.25
+
+    elif region == "full":
+        def sample(arr):
+            return arr[::S, ::S, :].mean(axis=(0, 1))
+
+    else:
+        raise ValueError(f"Unknown region {region!r}. "
+                         "Use: top bottom left right border full")
+
+    return sample
+
+
+REGIONS = ["top", "bottom", "left", "right", "border", "full"]
+
+
 class PwCapture:
     """
     Connects to Mutter ScreenCast PipeWire node `node_id` and calls
     `callback(r, g, b)` with each frame's average colour.
+
+    `region` controls which part of the frame is sampled:
+        top | bottom | left | right | border (default) | full
 
     Strategy:
       1. Connect stream with SPA_ID_INVALID (no target), creating our input node.
@@ -227,9 +297,10 @@ class PwCapture:
       3. Frames flow once the link goes active.
     """
 
-    def __init__(self, node_id: int, callback):
+    def __init__(self, node_id: int, callback, region: str = "border"):
         self._node_id = node_id
         self._cb      = callback
+        self._sample  = _make_sampler(region)
         self._loop    = None
         self._ctx     = None
         self._core    = None
@@ -334,18 +405,7 @@ class PwCapture:
                             arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4)
                         else:
                             return
-                        # Sample only the outer 20% edge, every 8th pixel.
-                        # Average the four edges independently (avoids concatenate
-                        # allocation); weighting difference is negligible.
-                        bh = max(1, h // 5)
-                        bw = max(1, w // 5)
-                        s  = 8
-                        bgra = (
-                            arr[:bh:s,      ::s,    :].mean(axis=(0, 1))
-                            + arr[-bh::s,   ::s,    :].mean(axis=(0, 1))
-                            + arr[bh:-bh:s, :bw:s,  :].mean(axis=(0, 1))
-                            + arr[bh:-bh:s, -bw::s, :].mean(axis=(0, 1))
-                        ) * 0.25
+                        bgra = self._sample(arr)
                         b, g, r, _ = bgra
                         self._cb(int(r), int(g), int(b))
                     finally:

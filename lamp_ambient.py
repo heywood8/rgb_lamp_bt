@@ -28,7 +28,7 @@ gi.require_version("Gio", "2.0")
 from gi.repository import GLib, Gio
 
 from bleak import BleakClient
-from pw_capture import PwCapture
+from pw_capture import PwCapture, REGIONS
 
 MAC  = "FF:24:03:18:45:51"
 FFF3 = "0000fff3-0000-1000-8000-00805f9b34fb"
@@ -223,6 +223,13 @@ def main() -> None:
     for mode_name in MODES:
         group.add_argument(f"--{mode_name}", action="store_true",
                            help=f"{mode_name} mode")
+    parser.add_argument(
+        "--region",
+        choices=REGIONS,
+        default="border",
+        metavar="REGION",
+        help="screen area to sample: " + ", ".join(REGIONS) + " (default: border)",
+    )
     args = parser.parse_args()
 
     # Determine active mode
@@ -234,7 +241,8 @@ def main() -> None:
 
     cfg = MODES[active]
     print(f"[main] mode={active}  alpha={cfg['alpha']}  "
-          f"ble_sleep={cfg['ble_sleep']}s  dead_zone={cfg['dead_zone']}°")
+          f"ble_sleep={cfg['ble_sleep']}s  dead_zone={cfg['dead_zone']}°  "
+          f"region={args.region}")
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 
@@ -264,7 +272,7 @@ def main() -> None:
         if frame_count % 30 == 0:
             print(f"[pw] frame #{frame_count}  rgb=({r},{g},{b})")
 
-    cap = PwCapture(node_id, on_frame)
+    cap = PwCapture(node_id, on_frame, region=args.region)
     try:
         cap.start()
     except Exception as exc:

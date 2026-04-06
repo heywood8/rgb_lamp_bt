@@ -4,10 +4,11 @@ lamp_tray.py — system tray indicator for the RGB ambient lamp
 
 Left-click or right-click the icon to open a menu:
   Off / Live / Fast / Regular / Slow
+  Region: Top / Bottom / Left / Right / Border / Full
 
 The icon label shows the active mode. The lamp_ambient.py script
-is managed as a subprocess; switching modes kills the old process
-and starts a new one.
+is managed as a subprocess; switching modes or regions kills the old
+process and starts a new one.
 """
 
 import os
@@ -23,17 +24,19 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator, Gtk, GLib
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lamp_ambient.py")
 PYTHON = sys.executable
 
-MODES = ["live", "fast", "regular", "slow"]
+MODES   = ["live", "fast", "regular", "slow"]
+REGIONS = ["top", "bottom", "left", "right", "border", "full"]
 
 # Icon names (from the system's icon theme — all commonly available)
-ICON_ON  = "weather-clear-night-symbolic"   # glowing moon ≈ ambient light
+ICON_ON  = "weather-clear-night-symbolic"
 ICON_OFF = "weather-clear-symbolic"
 
 
 class LampIndicator:
     def __init__(self):
-        self._proc: subprocess.Popen | None = None
-        self._mode: str | None = None
+        self._proc:   subprocess.Popen | None = None
+        self._mode:   str | None = None
+        self._region: str        = "border"
 
         self._ind = AppIndicator.Indicator.new(
             "rgb-lamp",
@@ -50,15 +53,37 @@ class LampIndicator:
     def _build_menu(self) -> None:
         menu = Gtk.Menu()
 
-        # Mode items (radio-style)
-        self._mode_items: dict[str, Gtk.CheckMenuItem] = {}
-        group = []
+        # --- Speed / mode ---
+        mode_label = Gtk.MenuItem(label="Speed")
+        mode_label.set_sensitive(False)
+        menu.append(mode_label)
+
+        self._mode_items: dict[str, Gtk.RadioMenuItem] = {}
+        group: list = []
         for name in MODES:
             item = Gtk.RadioMenuItem.new_with_label(group, name.capitalize())
             group = item.get_group()
             item.connect("activate", self._on_mode, name)
             menu.append(item)
             self._mode_items[name] = item
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # --- Region ---
+        region_label = Gtk.MenuItem(label="Sample region")
+        region_label.set_sensitive(False)
+        menu.append(region_label)
+
+        self._region_items: dict[str, Gtk.RadioMenuItem] = {}
+        rgroup: list = []
+        for name in REGIONS:
+            item = Gtk.RadioMenuItem.new_with_label(rgroup, name.capitalize())
+            rgroup = item.get_group()
+            if name == self._region:
+                item.set_active(True)
+            item.connect("activate", self._on_region, name)
+            menu.append(item)
+            self._region_items[name] = item
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -77,17 +102,19 @@ class LampIndicator:
 
     # ------------------------------------------------------------------
 
-    def _start(self, mode: str) -> None:
+    def _start(self, mode: str, region: str) -> None:
         self._stop()
-        print(f"[tray] starting --{mode}")
+        print(f"[tray] starting --{mode} --region {region}")
         self._proc = subprocess.Popen(
-            [PYTHON, SCRIPT, f"--{mode}"],
+            [PYTHON, SCRIPT, f"--{mode}", "--region", region],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        self._mode = mode
-        self._ind.set_icon_full(ICON_ON, f"Lamp: {mode}")
+        self._mode   = mode
+        self._region = region
+        label = f"{mode} · {region}"
+        self._ind.set_icon_full(ICON_ON, f"Lamp: {label}")
         self._ind.set_label(mode, mode)
         print(f"[tray] pid={self._proc.pid}")
 
@@ -111,17 +138,24 @@ class LampIndicator:
     # ------------------------------------------------------------------
 
     def _on_mode(self, item: Gtk.RadioMenuItem, mode: str) -> None:
-        # RadioMenuItem fires activate for both the newly selected AND the
-        # previously selected item (deselection). Only act on selection.
         if not item.get_active():
             return
         if self._mode == mode:
             return
-        self._start(mode)
+        self._start(mode, self._region)
+
+    def _on_region(self, item: Gtk.RadioMenuItem, region: str) -> None:
+        if not item.get_active():
+            return
+        if self._region == region and self._proc is not None:
+            return
+        self._region = region
+        # Only restart if already running
+        if self._mode is not None:
+            self._start(self._mode, self._region)
 
     def _on_off(self, _item) -> None:
         self._stop()
-        # Deselect all radio items without triggering _on_mode
         for item in self._mode_items.values():
             item.handler_block_by_func(self._on_mode)
             item.set_active(False)
@@ -134,7 +168,7 @@ class LampIndicator:
     # ------------------------------------------------------------------
 
     def _watch_proc(self) -> bool:
-        """GLib idle callback: detect if the subprocess died unexpectedly."""
+        """GLib timeout callback: detect if the subprocess died unexpectedly."""
         if self._proc is not None and self._proc.poll() is not None:
             print(f"[tray] process exited with code {self._proc.returncode}")
             self._proc = None
@@ -152,7 +186,6 @@ def main() -> None:
     ind = LampIndicator()
     GLib.timeout_add(2000, ind._watch_proc)
 
-    # Clean up subprocess on SIGINT/SIGTERM
     def _sig(signum, frame):
         ind._stop()
         Gtk.main_quit()
