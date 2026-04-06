@@ -18,6 +18,8 @@ REGIONS = ["top", "bottom", "left", "right", "border", "full"]
 def _detect() -> str:
     if _sys.platform == "win32":
         return "windows"
+    if _sys.platform == "darwin":
+        return "macos"
     if _sys.platform.startswith("linux"):
         # Require GLib/Gio — proxy for a D-Bus session (GNOME/systemd desktop)
         try:
@@ -29,7 +31,7 @@ def _detect() -> str:
             pass
     raise RuntimeError(
         f"Unsupported platform: {_sys.platform!r}. "
-        "Only 'gnome' (Linux with GLib/Gio) and 'windows' are planned."
+        "Supported: 'gnome' (Linux + GLib/Gio), 'macos', 'windows'."
     )
 
 
@@ -47,6 +49,9 @@ def get_capture_backend(callback, region: str = "border"):
     if _PLATFORM == "gnome":
         from platforms.gnome._capture import GnomeCaptureBackend
         return GnomeCaptureBackend(callback, region=region)
+    if _PLATFORM == "macos":
+        from platforms.macos import get_capture_backend as _m
+        return _m(callback, region=region)
     if _PLATFORM == "windows":
         from platforms.windows import get_capture_backend as _w
         return _w(callback, region=region)
@@ -68,6 +73,9 @@ def get_process_utils():
     if _PLATFORM in ("gnome", "linux"):
         from platforms.gnome._process import PosixProcessUtils
         return PosixProcessUtils()
+    if _PLATFORM == "macos":
+        from platforms.macos import get_process_utils as _m
+        return _m()
     if _PLATFORM == "windows":
         from platforms.windows import get_process_utils as _w
         return _w()
@@ -83,6 +91,9 @@ def get_tray_class():
     if _PLATFORM == "gnome":
         from platforms.gnome._tray import GtkTray
         return GtkTray
+    if _PLATFORM == "macos":
+        from platforms.macos import get_tray_class as _m
+        return _m()
     if _PLATFORM == "windows":
         from platforms.windows import get_tray_class as _w
         return _w()
