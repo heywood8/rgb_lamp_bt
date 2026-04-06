@@ -213,11 +213,16 @@ class _LampIndicator:
 
     def watch_proc(self) -> bool:
         if self._proc is not None and self._proc.poll() is not None:
-            _log(f"process exited with code {self._proc.returncode}")
+            code = self._proc.returncode
+            _log(f"process exited with code {code}")
             self._proc = None
-            self._mode = None
+            # If a mode was active (not a manual Off), restart automatically
+            if self._mode is not None:
+                _log(f"auto-restarting ({self._mode}, {self._region})")
+                self._start(self._mode, self._region)
+                return True
             self._mark_off()
-            self._ind.set_icon_full(ICON_OFF, "Lamp: off (crashed)")
+            self._ind.set_icon_full(ICON_OFF, "Lamp: off (stopped)")
             return True
 
         if self._pending and self._mode is not None:

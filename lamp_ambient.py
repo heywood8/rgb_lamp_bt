@@ -25,12 +25,15 @@ import signal
 import sys
 import threading
 
+import time
+
 from bleak import BleakClient
 from platforms import get_capture_backend, REGIONS
 
-MAC         = "FF:24:03:18:45:51"
-FFF3        = "0000fff3-0000-1000-8000-00805f9b34fb"
-STATUS_FILE = "/tmp/lamp_ambient.status"
+MAC              = "FF:24:03:18:45:51"
+FFF3             = "0000fff3-0000-1000-8000-00805f9b34fb"
+STATUS_FILE      = "/tmp/lamp_ambient.status"
+CAPTURE_TIMEOUT  = 15   # seconds without a frame before treating capture as dead
 
 MODES = {
     "live":    dict(alpha=0.80, ble_sleep=0.05, dead_zone=0),
@@ -110,6 +113,12 @@ async def ble_loop(color_state: dict, stop_event: threading.Event,
                 print(f"[ble] power-on sent (total writes: {writes})")
 
                 while client.is_connected and not stop_event.is_set():
+                    if time.monotonic() - last_frame_time[0] > CAPTURE_TIMEOUT:
+                        print(f"[main] no capture frame for {CAPTURE_TIMEOUT} s "
+                              f"— capture died, exiting for restart")
+                        stop_event.set()
+                        break
+
                     r, g, b = color_state.get("rgb", (128, 128, 128))
                     cmd, h_deg, s_pct = _rgb_to_hsv_cmd(r, g, b)
 
@@ -179,9 +188,11 @@ def main() -> None:
     color_state: dict = {}
     alpha       = cfg["alpha"]
     frame_count = 0
+    last_frame_time: list = [time.monotonic()]  # list so closure can mutate it
 
     def on_frame(r: int, g: int, b: int) -> None:
         nonlocal frame_count
+        last_frame_time[0] = time.monotonic()
         prev = color_state.get("rgb")
         if prev:
             pr, pg, pb = prev
