@@ -2,13 +2,16 @@
 """
 lamp_tray.py — system tray indicator for the RGB ambient lamp
 
-Left-click or right-click the icon to open a menu:
-  Off / Live / Fast / Regular / Slow
-  Region: Top / Bottom / Left / Right / Border / Full
+Click the icon to open a menu:
+  Speed:   Live / Fast / Regular / Slow  (click to start / switch)
+  Region:  Top / Bottom / Left / Right / Border / Full
+  Off      — stop the lamp
+  Quit     — exit the tray
 
-The icon label shows the active mode. The lamp_ambient.py script
-is managed as a subprocess; switching modes or regions kills the old
-process and starts a new one.
+The icon label shows the active mode. lamp_ambient.py is managed as a
+subprocess; switching modes or regions restarts it automatically.
+
+Logs go to /tmp/lamp_tray.log.
 """
 
 import fcntl
@@ -22,13 +25,13 @@ gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("Gtk", "3.0")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator, Gtk, GLib
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lamp_ambient.py")
-PYTHON = sys.executable
+SCRIPT  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lamp_ambient.py")
+PYTHON  = sys.executable
+LOGFILE = "/tmp/lamp_tray.log"
 
 MODES   = ["live", "fast", "regular", "slow"]
 REGIONS = ["top", "bottom", "left", "right", "border", "full"]
 
-# Icon names (from the system's icon theme — all commonly available)
 ICON_ON  = "weather-clear-night-symbolic"
 ICON_OFF = "weather-clear-symbolic"
 
@@ -47,6 +50,8 @@ class LampIndicator:
         self._ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self._ind.set_title("RGB Lamp")
 
+        self._mode_items:   dict[str, Gtk.CheckMenuItem] = {}
+        self._region_items: dict[str, Gtk.CheckMenuItem] = {}
         self._build_menu()
 
     # ------------------------------------------------------------------
@@ -55,15 +60,13 @@ class LampIndicator:
         menu = Gtk.Menu()
 
         # --- Speed / mode ---
-        mode_label = Gtk.MenuItem(label="Speed")
-        mode_label.set_sensitive(False)
-        menu.append(mode_label)
+        hdr = Gtk.MenuItem(label="Speed")
+        hdr.set_sensitive(False)
+        menu.append(hdr)
 
-        self._mode_items: dict[str, Gtk.RadioMenuItem] = {}
-        group: list = []
         for name in MODES:
-            item = Gtk.RadioMenuItem.new_with_label(group, name.capitalize())
-            group = item.get_group()
+            item = Gtk.CheckMenuItem(label=name.capitalize())
+            item.set_draw_as_radio(True)
             item.connect("activate", self._on_mode, name)
             menu.append(item)
             self._mode_items[name] = item
@@ -71,15 +74,13 @@ class LampIndicator:
         menu.append(Gtk.SeparatorMenuItem())
 
         # --- Region ---
-        region_label = Gtk.MenuItem(label="Sample region")
-        region_label.set_sensitive(False)
-        menu.append(region_label)
+        hdr2 = Gtk.MenuItem(label="Sample region")
+        hdr2.set_sensitive(False)
+        menu.append(hdr2)
 
-        self._region_items: dict[str, Gtk.RadioMenuItem] = {}
-        rgroup: list = []
         for name in REGIONS:
-            item = Gtk.RadioMenuItem.new_with_label(rgroup, name.capitalize())
-            rgroup = item.get_group()
+            item = Gtk.CheckMenuItem(label=name.capitalize())
+            item.set_draw_as_radio(True)
             if name == self._region:
                 item.set_active(True)
             item.connect("activate", self._on_region, name)
@@ -103,26 +104,44 @@ class LampIndicator:
 
     # ------------------------------------------------------------------
 
+    def _set_mode_check(self, active_mode: str | None) -> None:
+        """Update checkmarks without triggering callbacks."""
+        for name, item in self._mode_items.items():
+            item.handler_block_by_func(self._on_mode)
+            item.set_active(name == active_mode)
+            item.handler_unblock_by_func(self._on_mode)
+
+    def _set_region_check(self, active_region: str) -> None:
+        for name, item in self._region_items.items():
+            item.handler_block_by_func(self._on_region)
+            item.set_active(name == active_region)
+            item.handler_unblock_by_func(self._on_region)
+
+    # ------------------------------------------------------------------
+
     def _start(self, mode: str, region: str) -> None:
-        self._stop()
-        print(f"[tray] starting --{mode} --region {region}")
+        self._stop_proc()
+        log(f"starting --{mode} --region {region}")
+        logf = open(LOGFILE, "a")
         self._proc = subprocess.Popen(
             [PYTHON, SCRIPT, f"--{mode}", "--region", region],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=logf,
             start_new_session=True,
         )
+        logf.close()
         self._mode   = mode
         self._region = region
-        label = f"{mode} · {region}"
-        self._ind.set_icon_full(ICON_ON, f"Lamp: {label}")
+        self._ind.set_icon_full(ICON_ON, f"Lamp: {mode} · {region}")
         self._ind.set_label(mode, mode)
-        print(f"[tray] pid={self._proc.pid}")
+        self._set_mode_check(mode)
+        self._set_region_check(region)
+        log(f"pid={self._proc.pid}")
 
-    def _stop(self) -> None:
+    def _stop_proc(self) -> None:
         if self._proc is None:
             return
-        print(f"[tray] stopping pid={self._proc.pid}")
+        log(f"stopping pid={self._proc.pid}")
         try:
             os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
         except ProcessLookupError:
@@ -133,58 +152,60 @@ class LampIndicator:
             self._proc.kill()
         self._proc = None
         self._mode = None
+
+    def _mark_off(self) -> None:
         self._ind.set_icon_full(ICON_OFF, "Lamp: off")
         self._ind.set_label("", "")
+        self._set_mode_check(None)
 
     # ------------------------------------------------------------------
 
-    def _on_mode(self, item: Gtk.RadioMenuItem, mode: str) -> None:
+    def _on_mode(self, item: Gtk.CheckMenuItem, mode: str) -> None:
         if not item.get_active():
-            return
-        if self._mode == mode:
+            # User unchecked the current mode — treat as Off
+            if self._mode == mode:
+                self._stop_proc()
+                self._mark_off()
             return
         self._start(mode, self._region)
 
-    def _on_region(self, item: Gtk.RadioMenuItem, region: str) -> None:
+    def _on_region(self, item: Gtk.CheckMenuItem, region: str) -> None:
         if not item.get_active():
             return
         if self._region == region and self._proc is not None:
             return
         self._region = region
-        # Only restart if already running
+        self._set_region_check(region)
         if self._mode is not None:
-            self._start(self._mode, self._region)
+            self._start(self._mode, region)
 
     def _on_off(self, _item) -> None:
-        self._stop()
-        for item in self._mode_items.values():
-            item.handler_block_by_func(self._on_mode)
-            item.set_active(False)
-            item.handler_unblock_by_func(self._on_mode)
+        self._stop_proc()
+        self._mark_off()
 
     def _on_quit(self, _item) -> None:
-        self._stop()
+        self._stop_proc()
         Gtk.main_quit()
 
     # ------------------------------------------------------------------
 
-    def _watch_proc(self) -> bool:
-        """GLib timeout callback: detect if the subprocess died unexpectedly."""
+    def watch_proc(self) -> bool:
         if self._proc is not None and self._proc.poll() is not None:
-            print(f"[tray] process exited with code {self._proc.returncode}")
+            log(f"process exited with code {self._proc.returncode}")
             self._proc = None
             self._mode = None
-            self._ind.set_icon_full(ICON_OFF, "Lamp: off (stopped)")
-            self._ind.set_label("", "")
-            for item in self._mode_items.values():
-                item.handler_block_by_func(self._on_mode)
-                item.set_active(False)
-                item.handler_unblock_by_func(self._on_mode)
-        return True  # keep calling
+            self._ind.set_icon_full(ICON_OFF, "Lamp: off (crashed)")
+            self._mark_off()
+        return True
+
+
+# ---------------------------------------------------------------------------
+
+def log(msg: str) -> None:
+    print(f"[tray] {msg}", flush=True)
 
 
 def _acquire_lock():
-    """Exit immediately if another instance is already running."""
     lock_path = "/tmp/rgb-lamp-tray.lock"
     f = open(lock_path, "w")
     try:
@@ -192,23 +213,31 @@ def _acquire_lock():
     except BlockingIOError:
         print("lamp_tray already running — exiting")
         sys.exit(0)
-    return f  # keep open for the lifetime of the process
+    return f
 
 
 def main() -> None:
-    _lock = _acquire_lock()  # noqa: F841 — must stay alive
+    _lock = _acquire_lock()  # noqa: F841
+
+    # Redirect our own stdout/stderr to the log file
+    logf = open(LOGFILE, "a")
+    sys.stdout = logf
+    sys.stderr = logf
+
+    log("started")
 
     ind = LampIndicator()
-    GLib.timeout_add(2000, ind._watch_proc)
+    GLib.timeout_add(2000, ind.watch_proc)
 
     def _sig(signum, frame):
-        ind._stop()
+        ind._stop_proc()
         Gtk.main_quit()
 
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
 
     Gtk.main()
+    log("exited")
 
 
 if __name__ == "__main__":
