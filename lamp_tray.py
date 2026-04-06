@@ -25,9 +25,10 @@ gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("Gtk", "3.0")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator, Gtk, GLib
 
-SCRIPT  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lamp_ambient.py")
-PYTHON  = sys.executable
-LOGFILE = "/tmp/lamp_tray.log"
+SCRIPT   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lamp_ambient.py")
+PYTHON   = sys.executable
+LOGFILE  = "/tmp/lamp_tray.log"
+PIDFILE  = "/tmp/lamp_ambient.pid"
 
 MODES   = ["live", "fast", "regular", "slow"]
 REGIONS = ["top", "bottom", "left", "right", "border", "full"]
@@ -130,6 +131,9 @@ class LampIndicator:
             start_new_session=True,
         )
         logf.close()
+        # Write pidfile so future tray instances can kill orphaned processes
+        with open(PIDFILE, "w") as f:
+            f.write(str(self._proc.pid))
         self._mode   = mode
         self._region = region
         self._ind.set_icon_full(ICON_ON, f"Lamp: {mode} · {region}")
@@ -139,6 +143,8 @@ class LampIndicator:
         log(f"pid={self._proc.pid}")
 
     def _stop_proc(self) -> None:
+        # Also kill any orphaned process from a previous tray session
+        _kill_pidfile()
         if self._proc is None:
             return
         log(f"stopping pid={self._proc.pid}")
@@ -152,6 +158,7 @@ class LampIndicator:
             self._proc.kill()
         self._proc = None
         self._mode = None
+        _clear_pidfile()
 
     def _mark_off(self) -> None:
         self._ind.set_icon_full(ICON_OFF, "Lamp: off")
@@ -205,6 +212,27 @@ def log(msg: str) -> None:
     print(f"[tray] {msg}", flush=True)
 
 
+def _kill_pidfile() -> None:
+    """Kill any lamp_ambient process recorded in the pidfile."""
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read().strip())
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            log(f"killed orphaned pid={pid}")
+        except ProcessLookupError:
+            pass
+    except (FileNotFoundError, ValueError):
+        pass
+
+
+def _clear_pidfile() -> None:
+    try:
+        os.unlink(PIDFILE)
+    except FileNotFoundError:
+        pass
+
+
 def _acquire_lock():
     lock_path = "/tmp/rgb-lamp-tray.lock"
     f = open(lock_path, "w")
@@ -225,6 +253,7 @@ def main() -> None:
     sys.stderr = logf
 
     log("started")
+    _kill_pidfile()  # clean up any orphan from a previous tray session
 
     ind = LampIndicator()
     GLib.timeout_add(2000, ind.watch_proc)
