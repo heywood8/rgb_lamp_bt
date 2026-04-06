@@ -25,23 +25,30 @@ gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("Gtk", "3.0")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator, Gtk, GLib
 
-SCRIPT   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lamp_ambient.py")
-PYTHON   = sys.executable
-LOGFILE  = "/tmp/lamp_tray.log"
-PIDFILE  = "/tmp/lamp_ambient.pid"
+SCRIPT      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lamp_ambient.py")
+PYTHON      = sys.executable
+LOGFILE     = "/tmp/lamp_tray.log"
+PIDFILE     = "/tmp/lamp_ambient.pid"
+STATUSFILE  = "/tmp/lamp_ambient.status"
 
 MODES   = ["live", "fast", "regular", "slow"]
 REGIONS = ["top", "bottom", "left", "right", "border", "full"]
 
-ICON_ON  = "weather-clear-night-symbolic"
-ICON_OFF = "weather-clear-symbolic"
+ICON_ON      = "weather-clear-night-symbolic"
+ICON_OFF     = "weather-clear-symbolic"
+ICON_PENDING = "content-loading-symbolic"
+
+_ANIM_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 class LampIndicator:
     def __init__(self):
-        self._proc:   subprocess.Popen | None = None
-        self._mode:   str | None = None
-        self._region: str        = "border"
+        self._proc:        subprocess.Popen | None = None
+        self._mode:        str | None = None
+        self._region:      str        = "border"
+        self._pending:     bool       = False
+        self._anim_frame:  int        = 0
+        self._anim_source: int | None = None  # GLib source id
 
         self._ind = AppIndicator.Indicator.new(
             "rgb-lamp",
@@ -131,22 +138,20 @@ class LampIndicator:
             start_new_session=True,
         )
         logf.close()
-        # Write pidfile so future tray instances can kill orphaned processes
         with open(PIDFILE, "w") as f:
             f.write(str(self._proc.pid))
         self._mode   = mode
         self._region = region
-        self._ind.set_icon_full(ICON_ON, f"Lamp: {mode} · {region}")
-        self._ind.set_label(mode, mode)
         self._set_mode_check(mode)
         self._set_region_check(region)
+        self._set_pending(True)
         log(f"pid={self._proc.pid}")
 
     def _stop_proc(self) -> None:
-        # Also kill any orphaned process from a previous tray session
         _kill_pidfile()
         if self._proc is None:
             return
+        self._set_pending(True)  # show pending while the process winds down
         log(f"stopping pid={self._proc.pid}")
         try:
             os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
@@ -159,11 +164,34 @@ class LampIndicator:
         self._proc = None
         self._mode = None
         _clear_pidfile()
+        self._set_pending(False)
 
     def _mark_off(self) -> None:
+        self._set_pending(False)
         self._ind.set_icon_full(ICON_OFF, "Lamp: off")
         self._ind.set_label("", "")
         self._set_mode_check(None)
+
+    def _set_pending(self, pending: bool) -> None:
+        self._pending = pending
+        if pending:
+            self._ind.set_icon_full(ICON_PENDING, "Lamp: connecting...")
+            self._anim_frame = 0
+            if self._anim_source is None:
+                self._anim_source = GLib.timeout_add(100, self._animate)
+        else:
+            if self._anim_source is not None:
+                GLib.source_remove(self._anim_source)
+                self._anim_source = None
+
+    def _animate(self) -> bool:
+        if not self._pending:
+            self._anim_source = None
+            return False
+        frame = _ANIM_FRAMES[self._anim_frame % len(_ANIM_FRAMES)]
+        self._anim_frame += 1
+        self._ind.set_label(frame, frame)
+        return True
 
     # ------------------------------------------------------------------
 
@@ -197,12 +225,29 @@ class LampIndicator:
     # ------------------------------------------------------------------
 
     def watch_proc(self) -> bool:
+        # Check if subprocess has exited unexpectedly
         if self._proc is not None and self._proc.poll() is not None:
             log(f"process exited with code {self._proc.returncode}")
             self._proc = None
             self._mode = None
-            self._ind.set_icon_full(ICON_OFF, "Lamp: off (crashed)")
             self._mark_off()
+            self._ind.set_icon_full(ICON_OFF, "Lamp: off (crashed)")
+            return True
+
+        # Check BLE status written by lamp_ambient.py
+        if self._pending and self._mode is not None:
+            try:
+                with open(STATUSFILE) as f:
+                    status = f.read().strip()
+                if status == "connected":
+                    log("BLE connected — lamp is on")
+                    self._set_pending(False)
+                    label = f"{self._mode} · {self._region}"
+                    self._ind.set_icon_full(ICON_ON, f"Lamp: {label}")
+                    self._ind.set_label(self._mode, self._mode)
+            except (FileNotFoundError, OSError):
+                pass
+
         return True
 
 
@@ -256,7 +301,7 @@ def main() -> None:
     _kill_pidfile()  # clean up any orphan from a previous tray session
 
     ind = LampIndicator()
-    GLib.timeout_add(2000, ind.watch_proc)
+    GLib.timeout_add(500, ind.watch_proc)
 
     def _sig(signum, frame):
         ind._stop_proc()

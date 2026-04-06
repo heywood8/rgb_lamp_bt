@@ -30,8 +30,9 @@ from gi.repository import GLib, Gio
 from bleak import BleakClient
 from pw_capture import PwCapture, REGIONS
 
-MAC  = "FF:24:03:18:45:51"
-FFF3 = "0000fff3-0000-1000-8000-00805f9b34fb"
+MAC         = "FF:24:03:18:45:51"
+FFF3        = "0000fff3-0000-1000-8000-00805f9b34fb"
+STATUS_FILE = "/tmp/lamp_ambient.status"
 
 _SC      = "org.gnome.Mutter.ScreenCast"
 _SC_PATH = "/org/gnome/Mutter/ScreenCast"
@@ -156,6 +157,14 @@ def get_mutter_node(bus: Gio.DBusConnection) -> int:
 # BLE loop
 # ---------------------------------------------------------------------------
 
+def _write_status(s: str) -> None:
+    try:
+        with open(STATUS_FILE, "w") as f:
+            f.write(s)
+    except OSError:
+        pass
+
+
 async def ble_loop(color_state: dict, stop_event: threading.Event,
                    ble_sleep: float, dead_zone: float) -> None:
     last_cmd: bytes | None = None
@@ -166,8 +175,10 @@ async def ble_loop(color_state: dict, stop_event: threading.Event,
     while not stop_event.is_set():
         try:
             print("[ble] connecting...")
+            _write_status("connecting")
             async with BleakClient(MAC) as client:
                 print("[ble] connected")
+                _write_status("connected")
                 await client.write_gatt_char(FFF3, _CMD_ON, response=False)
                 last_cmd = _CMD_ON
                 writes += 1
@@ -296,6 +307,7 @@ def main() -> None:
                              ble_sleep=cfg["ble_sleep"],
                              dead_zone=cfg["dead_zone"]))
     finally:
+        _write_status("off")
         cap.stop()
         print(f"[main] done. total frames captured: {frame_count}")
 
