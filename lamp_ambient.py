@@ -122,6 +122,13 @@ async def ble_loop(color_state: dict, stop_event: threading.Event,
                     r, g, b = color_state.get("rgb", (128, 128, 128))
                     cmd, h_deg, s_pct = _rgb_to_hsv_cmd(r, g, b)
 
+                    # If coming back from OFF, send power-on first
+                    if last_cmd == _CMD_OFF and cmd != _CMD_OFF:
+                        await client.write_gatt_char(FFF3, _CMD_ON, response=False)
+                        writes += 1
+                        print(f"[ble] write #{writes} power-on (resuming from dark)")
+                        last_cmd = _CMD_ON
+
                     if dead_zone > 0 and last_cmd not in (None, _CMD_ON):
                         h_diff = min(abs(h_deg - last_h), 360 - abs(h_deg - last_h))
                         s_diff = abs(s_pct - last_s)
