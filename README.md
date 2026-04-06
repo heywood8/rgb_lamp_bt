@@ -259,3 +259,73 @@ python3 lamp_ambient.py --slow     # alpha=0.10, 1 s,   15° dead zone
 The dead zone suppresses BLE writes when hue/saturation shifts are below a threshold, preventing the lamp from flickering in response to small colour noise during normal desk work.
 
 Total for part two: one Wayland dead end, one GStreamer dead end, a ctypes PipeWire client written from scratch, one swapped enum constant that cost most of a debugging session, and a mmap fix that recovered 3× the frame rate.
+
+---
+
+## Part Three: Making It Usable
+
+Running `python3 lamp_ambient.py --live` from a terminal every time you want ambient lighting is fine for testing. It is not fine as a daily workflow. Part three is about turning the script into something you can operate without opening a terminal.
+
+### System Tray Indicator
+
+The plan: a persistent indicator icon in the GNOME status bar with a menu. Click it, pick a mode, done. The machine already had `appindicatorsupport@rgcjonas.gmail.com` installed (the GNOME Shell extension that makes AppIndicator icons appear in the top bar) and `libayatana-appindicator` available as a Python GObject binding. That's everything needed.
+
+`lamp_tray.py` uses `AyatanaAppIndicator3` with GTK3. It spawns `lamp_ambient.py` as a subprocess, writes its PID to a file, and manages the lifecycle: start, stop, switch mode, restart on region change.
+
+A `.desktop` file goes into `~/.local/share/applications/` for the app launcher and `~/.config/autostart/` so it starts on login.
+
+### The RadioMenuItem Trap
+
+The first menu implementation used `Gtk.RadioMenuItem` for the mode selector — radio buttons being the natural fit for mutually exclusive options. It looked right in the menu. It did nothing when clicked.
+
+The bug: GTK's RadioMenuItem silently starts with the first item in the group pre-checked. Clicking an already-active RadioMenuItem does not fire the `activate` signal. So clicking "Live" — the first mode, and the one most likely to be clicked first — never triggered anything. Clicking "Fast" or "Regular" worked, because selecting them fired activate on the newly active item. But "Live" was a dead button.
+
+Switched to `Gtk.CheckMenuItem` with `set_draw_as_radio(True)` for the visual and manual mutual exclusion via `handler_block_by_func`. Every click is now explicit and tracked regardless of prior state.
+
+### Region Selection
+
+The next obvious question: which part of the screen should the lamp track? The border average that was hardcoded made sense for a lamp sitting behind the monitor, but a lamp off to the side should probably track the nearest edge. "Full screen" is useful if the lamp is overhead.
+
+Added a `--region` parameter to `lamp_ambient.py`:
+
+```bash
+python3 lamp_ambient.py --live --region right    # right edge only
+python3 lamp_ambient.py --slow --region full     # whole screen, slow tracking
+```
+
+Options: `top`, `bottom`, `left`, `right`, `border` (default — all four edges), `full`.
+
+The region is implemented as a closure built at startup — `_make_sampler(region)` returns a function that takes the numpy frame array and returns the mean BGRA. No per-frame branching. The tray menu got a second radio section so you can switch region without touching the terminal.
+
+### Smoothing Rethought
+
+The original mode design had each mode control three things: how fast the LERP tracked new frames (`alpha`), how often BLE writes went out (`ble_sleep`), and a hue dead zone that suppressed small changes. The idea was that "slow" mode would write to the lamp infrequently and ignore small shifts, making it calm for desk work.
+
+The result was that all modes except `--live` had visibly choppy transitions. A slow BLE write rate means the lamp steps between colours in visible jumps rather than gliding.
+
+Rethought: all modes use the same fast BLE write rate (50 ms) and no dead zone. The only thing that differs is `alpha`:
+
+| Mode    | Alpha | Effective lag |
+|---------|-------|---------------|
+| live    | 0.80  | ~0.4 s        |
+| fast    | 0.50  | ~1 s          |
+| regular | 0.20  | ~3 s          |
+| slow    | 0.05  | ~12 s         |
+
+The lamp always moves smoothly. The mode controls how quickly it chases the screen colour — not how often it moves.
+
+### The Orphan Process Problem
+
+The first time the tray was used in anger it immediately broke: the lamp stayed white and BLE wouldn't connect. The log showed the new `lamp_ambient.py` stuck at `[ble] connecting...` indefinitely.
+
+The reason: an older `lamp_ambient.py` process — started before `--region` was added, from a previous tray session — was still running and holding the BLE connection. The lamp was happily receiving white-screen commands from a process the tray didn't know existed.
+
+Fix: write `/tmp/lamp_ambient.pid` on each subprocess start. When `_stop_proc()` is called — and at tray startup — read and kill whatever PID is in that file before starting anything new. This covers processes from crashed or restarted tray sessions.
+
+### Pending State
+
+Starting the lamp involves connecting to BLE, which takes 2–5 seconds. Stopping it means sending SIGTERM and waiting for the process to wind down. During both of these, the old icon (moon = on, sun = off) was wrong: it claimed a state that wasn't true yet.
+
+`lamp_ambient.py` now writes a status to `/tmp/lamp_ambient.status`: `connecting` when the BLE attempt starts, `connected` when it succeeds, `off` when the process exits. The tray polls this file every 500 ms.
+
+While the status is `connecting` (or while `_stop_proc()` is executing), the tray shows `content-loading-symbolic` and runs a braille spinner animation in the label at 10 fps. When `connected` is read, the icon switches to the moon. The transition is visible and immediate rather than silent and ambiguous.
