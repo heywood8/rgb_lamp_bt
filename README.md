@@ -329,3 +329,49 @@ Starting the lamp involves connecting to BLE, which takes 2–5 seconds. Stoppin
 `lamp_ambient.py` now writes a status to `/tmp/lamp_ambient.status`: `connecting` when the BLE attempt starts, `connected` when it succeeds, `off` when the process exits. The tray polls this file every 500 ms.
 
 While the status is `connecting` (or while `_stop_proc()` is executing), the tray shows `content-loading-symbolic` and runs a braille spinner animation in the label at 10 fps. When `connected` is read, the icon switches to the moon. The transition is visible and immediate rather than silent and ambiguous.
+
+---
+
+## Part Four: Protocol Archaeology
+
+With ambient mode working day-to-day, curiosity won out: the original DEX scan had found 13 commands starting with `bc` that we only partially understood. Time to send each one to the lamp and document exactly what it does — including the ones marked dangerous.
+
+The method: establish a baseline (lamp showing solid red via `bc 04 06 00 00 03 e8 00 00 55`), send one command, observe, recover, move on. Recovery after a cycling mode: send the colour command directly — no power cycle needed. Recovery after the lamp turns off: power on (`bc 01 01 01 55`) followed by a colour command. Recovery after deep sleep: physical button press only.
+
+### The Confirmed Command Table
+
+| Command | Effect | Recoverable? |
+|---------|--------|--------------|
+| `bc 01 01 01 55` | Power on — no visible change if already on | N/A |
+| `bc 01 01 00 55` | Power off — clean, BLE stays connectable | Yes — power on + colour |
+| `bc 04 06 [H>>8] [H&ff] [S*10>>8] [S*10&ff] 00 00 55` | Set colour (HSV) | N/A — this is the colour command |
+| `bc 0f 01 01 55` | Persistent colour cycling mode | Yes — colour command exits it immediately |
+| `bc 07 01 01 55` | Persistent cycling mode (different pattern) | Yes — colour command |
+| `bc 11 01 01 55` | Persistent cycling mode | Yes — colour command |
+| `bc 11 01 02 55` | Turns lamp off | Yes — power on + colour |
+| `bc 11 01 03 55` | Flashes once, then turns off | Yes — power on + colour |
+| `bc 11 01 04 55` | Persistent cycling mode (yet another pattern) | Yes — colour command |
+| `bc 05 06 00 00 00 00 00 00 55` | **Deep sleep** — BLE stays connectable, lamp ignores all commands | **No — physical button only** |
+| `bc 0c 01 01 55` | No effect | N/A |
+| `bc 0c 01 02 55` | No effect | N/A |
+| `bc 04 05 [any bytes] 55` | No effect | N/A |
+
+### Key Findings
+
+**`bc 04 06` is the master reset.** Every cycling mode — `0x0f`, `0x07`, `0x11/01`, `0x11/04` — exits immediately when a colour command arrives. You never need power-cycle to recover from a cycling mode. This is why the ambient script works after a physical button press drops the lamp into its default cycle mode: the first colour write our script sends breaks the cycle.
+
+**`0x11` is a mode selector.** Byte[3] is the argument: `01` = cycling, `02` = off, `03` = flash-then-off, `04` = different cycling. There are likely more values (`05`, `06`, ...) that we haven't tested — probably more lighting effects. The pattern matches the app's "mode" UI.
+
+**`bc 05 06 ...` is deep sleep.** This is the only command that requires a physical button press to recover. The lamp remains connectable over BLE — `BleakClient` connects, writes go through without errors — but the lamp hardware ignores everything. It is, effectively, off with no software wake path. Do not send this command in any automated context.
+
+**`bc 0c` and `bc 04 05` are inert.** Whatever these do in the firmware (if anything), sending them produces no visible change to an already-on lamp. They may be read commands, configuration commands that require specific arguments, or dead code.
+
+**Bytes 7–8 of the colour command are unused.** Several tests were made with non-zero values at positions 7 and 8 of `bc 04 06 ...`. The lamp's colour did not change. These bytes appear to be padding.
+
+**`bc 09 06 ...` uses a different layout.** The voice-mode command (used by the app's microphone feature) puts colour information at different byte positions and uses raw RGB-adjacent encoding rather than HSV. It's not useful for our purposes since `bc 04 06` is more ergonomic and fully understood.
+
+### The One Real Casualty
+
+Early in testing — before the systematic approach — an accidental sequence put the lamp into a state where all commands were silently accepted but nothing happened: BLE connected fine, writes completed with no errors, and the lamp sat there dark. That session required a physical button press to recover.
+
+The culprit was `bc 05 06` (deep sleep), triggered during an experimental command sequence. We initially suspected `bc 04 05` because it appeared nearby in the session, but systematic retesting showed `bc 04 05` to be completely inert. The deep sleep command is the only true hazard in the command set.
