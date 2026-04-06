@@ -36,15 +36,15 @@ FFF3 = "0000fff3-0000-1000-8000-00805f9b34fb"
 _SC      = "org.gnome.Mutter.ScreenCast"
 _SC_PATH = "/org/gnome/Mutter/ScreenCast"
 
-# Mode presets: (alpha, ble_sleep, dead_zone_hue_degrees)
-# alpha:      LERP weight for new frame (higher = faster convergence)
-# ble_sleep:  asyncio.sleep between BLE writes (seconds)
-# dead_zone:  minimum hue shift (°) or saturation shift before sending a new command
+# Mode presets — all modes use fast BLE writes (0.05 s) and no dead zone
+# so transitions are always smooth. Only alpha differs: it controls how
+# strongly each new captured frame pulls the running colour average.
+# Higher alpha = reacts faster to screen changes.
 MODES = {
-    "live":    dict(alpha=0.8,  ble_sleep=0.05, dead_zone=0),
-    "fast":    dict(alpha=0.5,  ble_sleep=0.10, dead_zone=3),
-    "regular": dict(alpha=0.25, ble_sleep=0.30, dead_zone=8),
-    "slow":    dict(alpha=0.10, ble_sleep=1.00, dead_zone=15),
+    "live":    dict(alpha=0.80, ble_sleep=0.05, dead_zone=0),
+    "fast":    dict(alpha=0.50, ble_sleep=0.05, dead_zone=0),
+    "regular": dict(alpha=0.20, ble_sleep=0.05, dead_zone=0),
+    "slow":    dict(alpha=0.05, ble_sleep=0.05, dead_zone=0),
 }
 
 
