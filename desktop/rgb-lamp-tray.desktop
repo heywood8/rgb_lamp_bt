@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=RGB Lamp
+Comment=Ambient lamp tray indicator
+Exec=/usr/bin/python3 /var/home/heywood8/rgb_lamp_bt/lamp_tray.py
+Icon=weather-clear-night-symbolic
+Terminal=false
+Type=Application
+Categories=Utility;
+Keywords=lamp;led;bluetooth;ambient;
+StartupNotify=false
