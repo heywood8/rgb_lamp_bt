@@ -11,6 +11,7 @@ is managed as a subprocess; switching modes or regions kills the old
 process and starts a new one.
 """
 
+import fcntl
 import os
 import signal
 import subprocess
@@ -182,7 +183,21 @@ class LampIndicator:
         return True  # keep calling
 
 
+def _acquire_lock():
+    """Exit immediately if another instance is already running."""
+    lock_path = "/tmp/rgb-lamp-tray.lock"
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("lamp_tray already running — exiting")
+        sys.exit(0)
+    return f  # keep open for the lifetime of the process
+
+
 def main() -> None:
+    _lock = _acquire_lock()  # noqa: F841 — must stay alive
+
     ind = LampIndicator()
     GLib.timeout_add(2000, ind._watch_proc)
 
