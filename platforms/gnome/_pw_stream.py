@@ -1,14 +1,10 @@
 """
-pw_capture.py — minimal PipeWire ctypes screen-capture client.
+platforms/gnome/_pw_stream.py — PipeWire ctypes screen-capture client.
 
-Connects to a Mutter ScreenCast PipeWire node and calls `callback(r, g, b)`
-for each frame with the average pixel colour.
+Linux/GNOME-specific. Connects to a Mutter ScreenCast PipeWire node and
+calls `callback(r, g, b)` for each frame with the sampled colour.
 
-Usage:
-    ctx = PwCapture(node_id, callback)
-    ctx.start()
-    # ... run your main loop ...
-    ctx.stop()
+Not imported directly — use platforms.get_capture_backend() instead.
 """
 
 import ctypes
