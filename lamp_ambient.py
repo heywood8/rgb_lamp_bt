@@ -2,21 +2,23 @@
 """
 lamp_ambient.py — screen ambient colour → GATT-DEMO BLE lamp
 
-Reads the average colour of your monitor via the xdg ScreenCast portal
-(PipeWire + GStreamer) and drives the lamp to match it continuously.
-
 Usage:
-  python3 lamp_ambient.py
+  python3 lamp_ambient.py [--live | --fast | --regular | --slow]
 
-A GNOME dialog will ask you to select a monitor to share.
+Modes:
+  --live     Most responsive. Tracks every frame change instantly.
+  --fast     Fast transitions, small dead zone.
+  --regular  Moderate smoothing and dead zone (default).
+  --slow     For desk work: slow blending, large dead zone, 1 s updates.
+
 Ctrl+C to stop.
 """
 
+import argparse
 import asyncio
 import colorsys
 import os
 import signal
-import subprocess
 import sys
 import threading
 
@@ -26,18 +28,28 @@ gi.require_version("Gio", "2.0")
 from gi.repository import GLib, Gio
 
 from bleak import BleakClient
+from pw_capture import PwCapture
 
 MAC  = "FF:24:03:18:45:51"
 FFF3 = "0000fff3-0000-1000-8000-00805f9b34fb"
 
-_PORTAL_BUS  = "org.freedesktop.portal.Desktop"
-_PORTAL_PATH = "/org/freedesktop/portal/desktop"
-_PORTAL_SC   = "org.freedesktop.portal.ScreenCast"
-_PORTAL_REQ  = "org.freedesktop.portal.Request"
+_SC      = "org.gnome.Mutter.ScreenCast"
+_SC_PATH = "/org/gnome/Mutter/ScreenCast"
+
+# Mode presets: (alpha, ble_sleep, dead_zone_hue_degrees)
+# alpha:      LERP weight for new frame (higher = faster convergence)
+# ble_sleep:  asyncio.sleep between BLE writes (seconds)
+# dead_zone:  minimum hue shift (°) or saturation shift before sending a new command
+MODES = {
+    "live":    dict(alpha=0.8,  ble_sleep=0.05, dead_zone=0),
+    "fast":    dict(alpha=0.5,  ble_sleep=0.10, dead_zone=3),
+    "regular": dict(alpha=0.25, ble_sleep=0.30, dead_zone=8),
+    "slow":    dict(alpha=0.10, ble_sleep=1.00, dead_zone=15),
+}
 
 
 # ---------------------------------------------------------------------------
-# BLE command helpers
+# BLE helpers
 # ---------------------------------------------------------------------------
 
 def _cmd_power(on: bool) -> bytes:
@@ -58,218 +70,98 @@ _CMD_OFF   = _cmd_power(False)
 _CMD_ON    = _cmd_power(True)
 
 
-def _rgb_to_cmd(r: int, g: int, b: int) -> bytes:
+def _rgb_to_hsv_cmd(r: int, g: int, b: int):
+    """Return (cmd_bytes, h_deg, s_pct) for the given RGB."""
     h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
     if v < 0.05:
-        return _CMD_OFF
+        return _CMD_OFF, 0.0, 0.0
     if s < 0.15:
-        return _CMD_WHITE
-    return _cmd_hsv(h * 360, s * 100)
+        return _CMD_WHITE, 0.0, 0.0
+    h_deg = h * 360
+    s_pct = s * 100
+    return _cmd_hsv(h_deg, s_pct), h_deg, s_pct
 
 
 # ---------------------------------------------------------------------------
-# xdg ScreenCast portal
+# Mutter ScreenCast portal — no dialog, GNOME-internal API
 # ---------------------------------------------------------------------------
 
-def _req_path(bus: Gio.DBusConnection, token: str) -> str:
-    sender = bus.get_unique_name().lstrip(":").replace(".", "_")
-    return f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+def get_mutter_node(bus: Gio.DBusConnection) -> int:
+    """
+    Create a Mutter ScreenCast session, record the primary monitor, start it,
+    and return the PipeWire node_id from the PipeWireStreamAdded signal.
+    """
+    try:
+        r = bus.call_sync(
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig", "GetCurrentState",
+            None, None, Gio.DBusCallFlags.NONE, -1, None,
+        )
+        _serial, monitors, _lgroups, _props = r.unpack()
+        connector = monitors[0][0][0]
+    except Exception as e:
+        print(f"[mutter] DisplayConfig error: {e} — trying HDMI-1")
+        connector = "HDMI-1"
 
+    print(f"[mutter] using connector: {connector}")
 
-def _call_and_wait(
-    bus: Gio.DBusConnection,
-    proxy: Gio.DBusProxy,
-    method: str,
-    params: GLib.Variant,
-    req_token: str,
-) -> dict:
-    """Subscribe to portal Response signal before calling method, then wait."""
-    req_path = _req_path(bus, req_token)
-    outcome: dict = {}
     loop = GLib.MainLoop()
+    result: dict = {}
 
-    def on_response(conn, sender, path, iface, sig, variant, _):
-        status, results = variant.unpack()
-        outcome["status"] = status
-        outcome["results"] = results
+    r = bus.call_sync(
+        _SC, _SC_PATH, _SC, "CreateSession",
+        GLib.Variant("(a{sv})", ({},)),
+        GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None,
+    )
+    session = r.unpack()[0]
+    print(f"[mutter] session: {session}")
+
+    r = bus.call_sync(
+        _SC, session, _SC + ".Session", "RecordMonitor",
+        GLib.Variant("(sa{sv})", (connector, {})),
+        GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None,
+    )
+    stream_path = r.unpack()[0]
+    print(f"[mutter] stream path: {stream_path}")
+
+    def on_stream_added(conn, sender, path, iface, sig, params, _):
+        node_id = params.unpack()[0]
+        print(f"[mutter] PipeWireStreamAdded: node_id={node_id}")
+        result["node_id"] = node_id
         loop.quit()
 
-    sub = bus.signal_subscribe(
-        None, _PORTAL_REQ, "Response", req_path,
-        None, Gio.DBusSignalFlags.NONE, on_response, None,
+    bus.signal_subscribe(
+        _SC, _SC + ".Stream", "PipeWireStreamAdded",
+        stream_path, None, Gio.DBusSignalFlags.NONE,
+        on_stream_added, None,
     )
-    proxy.call_sync(method, params, Gio.DBusCallFlags.NONE, -1, None)
+
+    bus.call_sync(
+        _SC, session, _SC + ".Session", "Start",
+        None, None, Gio.DBusCallFlags.NONE, -1, None,
+    )
+    print("[mutter] Start called, waiting for PipeWireStreamAdded signal...")
+
+    GLib.timeout_add(5000, loop.quit)
     loop.run()
-    bus.signal_unsubscribe(sub)
 
-    if outcome.get("status", 1) != 0:
-        raise RuntimeError(
-            f"Portal '{method}' rejected (status={outcome.get('status')})"
-        )
-    return outcome["results"]
+    if "node_id" not in result:
+        raise RuntimeError("PipeWireStreamAdded signal not received within 5 s")
 
-
-_TOKEN_FILE = os.path.expanduser("~/.local/share/lamp_ambient.token")
-
-
-def _load_token() -> str | None:
-    try:
-        return open(_TOKEN_FILE).read().strip() or None
-    except FileNotFoundError:
-        return None
-
-
-def _save_token(token: str) -> None:
-    os.makedirs(os.path.dirname(_TOKEN_FILE), exist_ok=True)
-    open(_TOKEN_FILE, "w").write(token)
-
-
-_portal_refs: list = []   # keep bus/proxy alive for the process lifetime
-
-
-def setup_screencast() -> tuple[int, int]:
-    """Drive the xdg ScreenCast portal. Returns (pipewire_fd, node_id)."""
-    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    pid = os.getpid()
-
-    proxy = Gio.DBusProxy.new_sync(
-        bus, Gio.DBusProxyFlags.NONE, None,
-        _PORTAL_BUS, _PORTAL_PATH, _PORTAL_SC, None,
-    )
-
-    # 1. CreateSession
-    sess_tok = f"lampsess{pid}"
-    r1_tok   = f"lamp1{pid}"
-    r1 = _call_and_wait(bus, proxy, "CreateSession",
-        GLib.Variant("(a{sv})", ({
-            "handle_token":         GLib.Variant("s", r1_tok),
-            "session_handle_token": GLib.Variant("s", sess_tok),
-        },)),
-        r1_tok,
-    )
-    session = r1["session_handle"]
-
-    # 2. SelectSources (types=1 → MONITOR)
-    # persist_mode=2: remember selection until explicitly revoked.
-    # restore_token: if we saved one last time, pass it back — no dialog shown.
-    saved_token = _load_token()
-    select_opts: dict = {
-        "handle_token": GLib.Variant("s", f"lamp2{pid}"),
-        "types":        GLib.Variant("u", 1),
-        "multiple":     GLib.Variant("b", False),
-        "persist_mode": GLib.Variant("u", 2),
-    }
-    if saved_token:
-        print(f"[portal] using saved restore token")
-        select_opts["restore_token"] = GLib.Variant("s", saved_token)
-    r2_tok = f"lamp2{pid}"
-    _call_and_wait(bus, proxy, "SelectSources",
-        GLib.Variant("(oa{sv})", (session, select_opts)),
-        r2_tok,
-    )
-
-    # 3. Start → response contains streams + new restore_token
-    r3_tok = f"lamp3{pid}"
-    r3 = _call_and_wait(bus, proxy, "Start",
-        GLib.Variant("(osa{sv})", (session, "", {
-            "handle_token": GLib.Variant("s", r3_tok),
-        })),
-        r3_tok,
-    )
-    streams = r3["streams"]
-    node_id = int(streams[0][0])
-    stream_props = streams[0][1] if len(streams[0]) > 1 else {}
-    print(f"[portal] node_id={node_id}  props={dict(stream_props)}")
-
-    new_token = r3.get("restore_token")
-    if new_token:
-        _save_token(new_token)
-        print(f"[portal] restore token saved — next run needs no dialog")
-
-    # 4. OpenPipeWireRemote → Unix FD (no Request pattern, returns directly)
-    result_v, fd_list = proxy.call_with_unix_fd_list_sync(
-        "OpenPipeWireRemote",
-        GLib.Variant("(oa{sv})", (session, {})),
-        Gio.DBusCallFlags.NONE, -1, None, None,
-    )
-    fd_index = result_v.unpack()[0]
-    pw_fd = fd_list.get(fd_index)
-
-    # Keep bus and proxy alive so the portal session isn't closed by GC
-    _portal_refs.extend([bus, proxy])
-
-    print(f"[portal] pw_fd={pw_fd}")
-    return pw_fd, node_id
-
-
-# ---------------------------------------------------------------------------
-# Frame capture via gst-launch-1.0 subprocess
-# ---------------------------------------------------------------------------
-
-FRAME_W = 64
-FRAME_H = 64
-FRAME_BYTES = FRAME_W * FRAME_H * 3  # RGB24
-
-
-def start_capture(pw_fd: int, node_id: int, color_state: dict) -> subprocess.Popen:
-    """
-    Spawn gst-launch-1.0 with the PipeWire fd, read raw 64×64 RGB frames from
-    its stdout, compute EMA-smoothed average colour into color_state['rgb'].
-    """
-    pipeline = (
-        f"pipewiresrc target-object={node_id} ! "
-        "videoconvert ! videoscale ! "
-        f"video/x-raw,format=RGB,width={FRAME_W},height={FRAME_H} ! "
-        "fdsink sync=false"
-    )
-    print(f"[gst] {pipeline}")
-    os.close(pw_fd)  # not using restricted remote; close to avoid fd leak
-
-    proc = subprocess.Popen(
-        ["gst-launch-1.0"] + pipeline.split(),
-        stdout=subprocess.PIPE,
-    )
-
-    def reader():
-        alpha = 0.2
-        while True:
-            data = proc.stdout.read(FRAME_BYTES)
-            if len(data) < FRAME_BYTES:
-                break
-            n = FRAME_BYTES // 3
-            r = sum(data[0::3]) // n
-            g = sum(data[1::3]) // n
-            b = sum(data[2::3]) // n
-            prev = color_state.get("rgb")
-            if prev:
-                pr, pg, pb = prev
-                r = int(alpha * r + (1 - alpha) * pr)
-                g = int(alpha * g + (1 - alpha) * pg)
-                b = int(alpha * b + (1 - alpha) * pb)
-            color_state["rgb"] = (r, g, b)
-
-    threading.Thread(target=reader, daemon=True).start()
-
-    # Give gst-launch a moment to start; check it didn't exit immediately
-    import time
-    time.sleep(1.5)
-    if proc.poll() is not None:
-        raise RuntimeError(
-            f"gst-launch-1.0 exited immediately (rc={proc.returncode}). "
-            "Check that gstreamer1-plugin-pipewire is installed."
-        )
-
-    return proc
+    return result["node_id"]
 
 
 # ---------------------------------------------------------------------------
 # BLE loop
 # ---------------------------------------------------------------------------
 
-async def ble_loop(color_state: dict, stop_event: threading.Event) -> None:
+async def ble_loop(color_state: dict, stop_event: threading.Event,
+                   ble_sleep: float, dead_zone: float) -> None:
     last_cmd: bytes | None = None
-    last_h: float | None = None
-    last_s: float | None = None
+    last_h: float = -999.0
+    last_s: float = -999.0
+    writes = 0
 
     while not stop_event.is_set():
         try:
@@ -278,26 +170,33 @@ async def ble_loop(color_state: dict, stop_event: threading.Event) -> None:
                 print("[ble] connected")
                 await client.write_gatt_char(FFF3, _CMD_ON, response=False)
                 last_cmd = _CMD_ON
+                writes += 1
+                print(f"[ble] power-on sent (total writes: {writes})")
 
                 while client.is_connected and not stop_event.is_set():
                     r, g, b = color_state.get("rgb", (128, 128, 128))
-                    cmd = _rgb_to_cmd(r, g, b)
+                    cmd, h_deg, s_pct = _rgb_to_hsv_cmd(r, g, b)
 
-                    if cmd != last_cmd:
-                        h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-                        h_deg, s_pct = h * 360, s * 100
-                        changed = (
-                            last_h is None
-                            or cmd in (_CMD_OFF, _CMD_WHITE)
-                            or abs(h_deg - last_h) > 8
-                            or abs(s_pct - last_s) > 8
-                        )
-                        if changed:
-                            await client.write_gatt_char(FFF3, cmd, response=False)
-                            last_cmd = cmd
-                            last_h, last_s = h_deg, s_pct
+                    if dead_zone > 0 and last_cmd not in (None, _CMD_ON):
+                        h_diff = abs(h_deg - last_h)
+                        # wrap-around hue distance
+                        h_diff = min(h_diff, 360 - h_diff)
+                        s_diff = abs(s_pct - last_s)
+                        skip = (h_diff < dead_zone and s_diff < dead_zone
+                                and cmd == last_cmd)
+                    else:
+                        skip = (cmd == last_cmd)
 
-                    await asyncio.sleep(0.3)
+                    if not skip:
+                        await client.write_gatt_char(FFF3, cmd, response=False)
+                        writes += 1
+                        print(f"[ble] write #{writes} h={h_deg:.1f}° s={s_pct:.1f}%"
+                              f"  rgb=({r},{g},{b})")
+                        last_cmd = cmd
+                        last_h = h_deg
+                        last_s = s_pct
+
+                    await asyncio.sleep(ble_sleep)
 
         except Exception as exc:
             if stop_event.is_set():
@@ -311,20 +210,68 @@ async def ble_loop(color_state: dict, stop_event: threading.Event) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("Setting up ScreenCast portal (a GNOME dialog will appear)...")
+    parser = argparse.ArgumentParser(
+        description="Screen ambient colour → BLE lamp",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="\n".join(
+            f"  --{m:8s}  alpha={v['alpha']:.2f}  poll={v['ble_sleep']:.2f}s"
+            f"  dead_zone={v['dead_zone']}°"
+            for m, v in MODES.items()
+        ),
+    )
+    group = parser.add_mutually_exclusive_group()
+    for mode_name in MODES:
+        group.add_argument(f"--{mode_name}", action="store_true",
+                           help=f"{mode_name} mode")
+    args = parser.parse_args()
+
+    # Determine active mode
+    active = "regular"
+    for mode_name in MODES:
+        if getattr(args, mode_name):
+            active = mode_name
+            break
+
+    cfg = MODES[active]
+    print(f"[main] mode={active}  alpha={cfg['alpha']}  "
+          f"ble_sleep={cfg['ble_sleep']}s  dead_zone={cfg['dead_zone']}°")
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    print("[mutter] setting up screen cast...")
     try:
-        pw_fd, node_id = setup_screencast()
+        node_id = get_mutter_node(bus)
     except Exception as exc:
-        print(f"Portal setup failed: {exc}", file=sys.stderr)
+        print(f"ScreenCast setup failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    print("Starting capture pipeline...")
+    print(f"[mutter] node_id={node_id} — capture starting")
+
     color_state: dict = {}
+    alpha = cfg["alpha"]
+    frame_count = 0
+
+    def on_frame(r: int, g: int, b: int) -> None:
+        nonlocal frame_count
+        prev = color_state.get("rgb")
+        if prev:
+            pr, pg, pb = prev
+            r = int(alpha * r + (1 - alpha) * pr)
+            g = int(alpha * g + (1 - alpha) * pg)
+            b = int(alpha * b + (1 - alpha) * pb)
+        color_state["rgb"] = (r, g, b)
+        frame_count += 1
+        if frame_count % 30 == 0:
+            print(f"[pw] frame #{frame_count}  rgb=({r},{g},{b})")
+
+    cap = PwCapture(node_id, on_frame)
     try:
-        proc = start_capture(pw_fd, node_id, color_state)
+        cap.start()
     except Exception as exc:
-        print(f"Capture failed: {exc}", file=sys.stderr)
+        print(f"PipeWire capture failed: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    print("[pw] capture started")
 
     stop_event = threading.Event()
 
@@ -337,11 +284,12 @@ def main() -> None:
 
     print("[main] running — Ctrl+C to stop")
     try:
-        asyncio.run(ble_loop(color_state, stop_event))
+        asyncio.run(ble_loop(color_state, stop_event,
+                             ble_sleep=cfg["ble_sleep"],
+                             dead_zone=cfg["dead_zone"]))
     finally:
-        proc.terminate()
-        proc.wait()
-        print("[main] done.")
+        cap.stop()
+        print(f"[main] done. total frames captured: {frame_count}")
 
 
 if __name__ == "__main__":

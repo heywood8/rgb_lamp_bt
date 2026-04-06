@@ -165,3 +165,97 @@ python3 lamp.py off
 It converts RGB input to HSV internally via `colorsys`, builds the 10-byte command, connects to the lamp over BLE using `bleak`, and sends it. Total dependency: just `bleak`.
 
 The whole thing — from "I have a lamp" to working colour control — required: one broken USB cable, four btsnoop capture attempts, one broken jadx install, a custom DEX string parser, a custom fill-array-data scanner, a register-tracing Dalvik disassembler, and a lot of patience with byte positions.
+
+---
+
+## Part Two: Ambient Mode
+
+With the protocol cracked, the obvious next step was ambient lighting: read the average colour of the screen and continuously update the lamp to match. Simple idea. The implementation turned into its own debugging odyssey.
+
+### First Attempt: `mss`
+
+`mss` is a minimal cross-platform screen capture library that calls `XGetImage()` under the hood. It works fine on X11. On GNOME under Wayland — which is what this machine runs — it produces:
+
+```
+mss.exception.ScreenShotError: XGetImage() failed
+```
+
+The GNOME compositor doesn't expose its framebuffer through XWayland. So mss was out, and so was anything else going through X11.
+
+### The Right Path: Mutter ScreenCast API
+
+GNOME exposes a private D-Bus API — `org.gnome.Mutter.ScreenCast` — that lets you capture the screen without a user-visible dialog (unlike the XDG portal, which pops up a picker every time). The flow:
+
+1. `CreateSession` → get a session object path
+2. `RecordMonitor` on the session → get a stream object path
+3. Subscribe to `PipeWireStreamAdded` on the stream
+4. Call `Start` on the session
+5. Wait for the signal → receive a PipeWire `node_id`
+
+That `node_id` is a node in the PipeWire graph being pushed to by gnome-shell. You then connect your own PipeWire client to it as a consumer.
+
+GStreamer's `pipewiresrc` element should theoretically do the consumer side, but it consistently failed on this system (`PipeWire 1.4.10`, `GStreamer 1.26.11`) with `target not found` errors regardless of how the target-object property was set. So we went lower: ctypes bindings directly against `libpipewire-0.3.so`.
+
+### PipeWire via ctypes
+
+`pw_capture.py` implements a PipeWire stream consumer without WirePlumber or any higher-level middleware:
+
+1. `pw_init()`, `pw_thread_loop_new()`, `pw_context_new()`, `pw_core_connect()`
+2. Create stream with `pw_stream_new()` and properties:
+   ```
+   media.type=Video
+   media.category=Capture
+   media.role=Screen
+   media.class=Stream/Input/Video
+   ```
+   The `media.class` matters: without it, the stream registers as `Stream/Output/Video` in the graph, and link creation fails silently.
+3. `pw_stream_connect()` with `SPA_ID_INVALID` as the target (no AUTOCONNECT), then wait for the `paused` state event.
+4. After a 500 ms delay (for port registration to propagate in the global graph), call `pw_core_create_object("link-factory", ...)` to wire gnome-shell's output node to our input node.
+
+The 500 ms delay is load-bearing. Without it, the link-factory call says "unknown input port (null)" because our node's ports haven't shown up in the global graph yet.
+
+### The Direction Bug
+
+The single hardest bug to find: the original code had `PW_DIRECTION_INPUT = 1`. PipeWire's SPA headers define:
+
+```c
+SPA_DIRECTION_INPUT  = 0
+SPA_DIRECTION_OUTPUT = 1
+```
+
+With direction=1 our stream created OUTPUT ports. The link-factory tried to connect gnome-shell (output) → our node (output) and couldn't. The stream reached `paused` and stayed there. Frames never arrived. There was no error — just silence.
+
+Fixing one constant (`PW_DIRECTION_INPUT = 0`) unblocked everything.
+
+### DMA-BUF Frames
+
+Mutter sends frames as DMA-BUF (SPA_DATA_DmaBuf, type=3). `PW_STREAM_FLAG_MAP_BUFFERS` only maps MemPtr/MemFd buffers — it does nothing for DMA-BUF. The buffer's `data` pointer is null; `fd` is a DMA-BUF file descriptor.
+
+The fix: `mmap.mmap(int(d.fd), d.maxsize, MAP_SHARED, PROT_READ)` in Python's `mmap` module. Then wrap it with `np.frombuffer(mm, dtype=np.uint8, count=size, offset=chunk.offset).reshape(h, w, 4)` for zero-copy numpy access. The initial version used `bytes(mm[offset:offset+size])` which copied 14 MB per frame and capped throughput at 1.5 fps.
+
+### Edge Sampling and Smoothing
+
+Two UX improvements:
+
+**Edge-only sampling.** If the lamp sits behind the monitor, averaging the full screen mixes background colours with the dominant content, producing muddy results. Instead, only the outer 20% border is sampled (top band, bottom band, left strip, right strip), with spatial step=8 to further reduce the pixel count. Result: the lamp colour tracks what's at the periphery of your vision, not what's in the centre.
+
+**LERP smoothing.** Without damping, a single bright flash — an explosion in a game, a white loading screen — would snap the lamp to white and back. An exponential moving average (`alpha * new + (1-alpha) * prev`) smooths transitions. Higher alpha = faster response.
+
+### Performance
+
+After the mmap fix and edge-only sampling: ~4–5 fps from the capture side. The bottleneck is GPU DMA-BUF synchronisation overhead, not numpy. At 5 fps the lamp updates every 200 ms, which is faster than the human eye tracks slow colour drifts. BLE writes go out at up to 20 Hz (every 50 ms), so the lamp never lags behind the computed colour.
+
+### CLI Modes
+
+`lamp_ambient.py` takes a mode flag to trade responsiveness for stability:
+
+```bash
+python3 lamp_ambient.py --live     # alpha=0.80, 50 ms BLE poll, no dead zone
+python3 lamp_ambient.py --fast     # alpha=0.50, 100 ms, 3° dead zone
+python3 lamp_ambient.py --regular  # alpha=0.25, 300 ms, 8° dead zone (default)
+python3 lamp_ambient.py --slow     # alpha=0.10, 1 s,   15° dead zone
+```
+
+The dead zone suppresses BLE writes when hue/saturation shifts are below a threshold, preventing the lamp from flickering in response to small colour noise during normal desk work.
+
+Total for part two: one Wayland dead end, one GStreamer dead end, a ctypes PipeWire client written from scratch, one swapped enum constant that cost most of a debugging session, and a mmap fix that recovered 3× the frame rate.
