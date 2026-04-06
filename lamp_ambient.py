@@ -92,7 +92,8 @@ def _write_status(s: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def ble_loop(color_state: dict, stop_event: threading.Event,
-                   ble_sleep: float, dead_zone: float) -> None:
+                   ble_sleep: float, dead_zone: float,
+                   last_frame_time: list) -> None:
     last_cmd: bytes | None = None
     last_h: float = -999.0
     last_s: float = -999.0
@@ -222,7 +223,8 @@ def main() -> None:
     try:
         asyncio.run(ble_loop(color_state, stop_event,
                              ble_sleep=cfg["ble_sleep"],
-                             dead_zone=cfg["dead_zone"]))
+                             dead_zone=cfg["dead_zone"],
+                             last_frame_time=last_frame_time))
     finally:
         _write_status("off")
         cap.stop()
