@@ -375,3 +375,50 @@ The method: establish a baseline (lamp showing solid red via `bc 04 06 00 00 03 
 Early in testing — before the systematic approach — an accidental sequence put the lamp into a state where all commands were silently accepted but nothing happened: BLE connected fine, writes completed with no errors, and the lamp sat there dark. That session required a physical button press to recover.
 
 The culprit was `bc 05 06` (deep sleep), triggered during an experimental command sequence. We initially suspected `bc 04 05` because it appeared nearby in the session, but systematic retesting showed `bc 04 05` to be completely inert. The deep sleep command is the only true hazard in the command set.
+
+---
+
+## Part Five: Crashing YouTube
+
+The ambient script had been running happily for a while when a new symptom appeared: opening a YouTube video while the lamp was on caused Chrome to show "Aw, Snap!" — error code 5, renderer killed. Reliably, every time.
+
+### The Real Problem
+
+`_on_process` — the PipeWire frame callback — was firing at display refresh rate. On a 60 Hz monitor, that's 60 calls per second. Each one that wasn't skipped by our capture rate limit was doing:
+
+```python
+mm = mmap.mmap(fd, d.maxsize, MAP_SHARED, PROT_READ)
+arr = np.frombuffer(mm, dtype=np.uint8, ...).reshape(h, w, 4)
+# ... sample ...
+mm.close()
+```
+
+For a 1920×1080 display at 4 bytes per pixel, `d.maxsize` is about 8 MB. Sixty times a second, we were mapping and unmapping 8 MB of DMA-BUF memory — the same GPU memory subsystem that YouTube's hardware video decoder uses for its frame pipeline.
+
+Chrome's renderer process was being killed by the OOM killer because the DMA-BUF heap was being saturated by our capture loop. The connection wasn't obvious: our script held no long-lived references and cleaned up each mmap correctly. The problem was *throughput*, not leaks — we were generating so much mmap/munmap pressure on the DMA-BUF heap that the video decoder couldn't get its buffers allocated in time.
+
+### The Fix
+
+Rate-limit the frame processing before touching the buffer:
+
+```python
+_CAPTURE_INTERVAL = 1.0 / 20  # max 20 fps processed
+
+@_CFUNC(None, _P)
+def _on_process(data):
+    pbuf = _pw.pw_stream_dequeue_buffer(self._stream)
+    if not pbuf:
+        return
+    try:
+        now = time.monotonic()
+        if now - self._last_frame < _CAPTURE_INTERVAL:
+            return          # skip — queue back without touching the DMA-BUF
+        self._last_frame = now
+        # ... mmap, sample, callback ...
+    finally:
+        _pw.pw_stream_queue_buffer(self._stream, pbuf)
+```
+
+The key is that the rate check happens *before* the mmap. Frames that arrive faster than 20 fps are queued back immediately — PipeWire sees them returned promptly, no DMA-BUF fd is mapped, no memory pressure is created. Only 1 in 3 frames (at 60 Hz) actually gets processed.
+
+20 fps is still far more than needed for ambient lighting: at `--live` with alpha=0.80, the lamp's LERP smoothing means you couldn't tell the difference between 5 fps and 20 fps of input. The fix dropped GPU memory bandwidth consumption by ~3× and the Chrome crash hasn't recurred.

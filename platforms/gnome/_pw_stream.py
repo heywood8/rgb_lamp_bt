@@ -278,6 +278,9 @@ def _make_sampler(region: str):
 REGIONS = ["top", "bottom", "left", "right", "border", "full"]
 
 
+_CAPTURE_INTERVAL = 1.0 / 20  # max 20 fps processed; queue back all others
+
+
 class PwCapture:
     """
     Connects to Mutter ScreenCast PipeWire node `node_id` and calls
@@ -291,21 +294,24 @@ class PwCapture:
       2. After paused + 500 ms (port registration delay), create a graph link
          from the gnome-shell source node to our input node via link-factory.
       3. Frames flow once the link goes active.
+      4. Rate-limited to _CAPTURE_INTERVAL — excess frames are queued back
+         immediately without mmapping, reducing DMA-BUF pressure.
     """
 
     def __init__(self, node_id: int, callback, region: str = "border"):
-        self._node_id = node_id
-        self._cb      = callback
-        self._sample  = _make_sampler(region)
-        self._loop    = None
-        self._ctx     = None
-        self._core    = None
-        self._stream  = None
-        self._link    = None        # pw_proxy* for the link
-        self._hook    = SpaHook()
-        self._events  = None        # keep alive (GC guard)
+        self._node_id    = node_id
+        self._cb         = callback
+        self._sample     = _make_sampler(region)
+        self._loop       = None
+        self._ctx        = None
+        self._core       = None
+        self._stream     = None
+        self._link       = None        # pw_proxy* for the link
+        self._hook       = SpaHook()
+        self._events     = None        # keep alive (GC guard)
         self._error: str | None = None
-        self._paused  = threading.Event()
+        self._paused     = threading.Event()
+        self._last_frame = 0.0         # monotonic time of last processed frame
         _pw.pw_init(None, None)
 
     # ------------------------------------------------------------------
@@ -365,6 +371,13 @@ class PwCapture:
                 if not pbuf:
                     return
                 try:
+                    # Rate-limit: skip frames that arrive faster than our cap.
+                    # Queue back immediately without touching the DMA-BUF.
+                    now = time.monotonic()
+                    if now - self._last_frame < _CAPTURE_INTERVAL:
+                        return
+                    self._last_frame = now
+
                     buf = pbuf.contents
                     spa = buf.buffer.contents
                     if spa.n_datas == 0:
@@ -374,7 +387,6 @@ class PwCapture:
                     size  = chunk.size
                     if size == 0:
                         return
-                    raw: bytes | None = None
                     stride = chunk.stride  # bytes per row
                     if stride <= 0:
                         return
